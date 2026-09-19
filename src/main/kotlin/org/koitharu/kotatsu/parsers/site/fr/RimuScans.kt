@@ -256,7 +256,7 @@ internal class RimuScans(context: MangaLoaderContext) :
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
 
-		// The reader renders each page as <img src="/uploads/mangas/{slug}/chapters/{n}/NNN.jpg?v=...">.
+		// The reader renders each page as <img src="/uploads/mangas/{slug}/chapters/{n}/NNN.webp?v=...">.
 		// The credits page lives under /uploads/credits/ and is excluded by the selector.
 		// Pages are served through the Next.js image optimizer so they arrive as WebP: this
 		// dodges buggy hardware JPEG decoders (e.g. MediaTek libjpeg-alpha) and cuts bandwidth.
@@ -279,10 +279,13 @@ internal class RimuScans(context: MangaLoaderContext) :
 	 * which serves WebP/AVIF instead of the original JPEG.
 	 */
 	private fun optimizedImageUrl(path: String, width: Int): String {
+		// Drop any cache-busting query (?v=...) or fragment before encoding: the Next.js
+		// optimizer returns HTTP 400 when they are folded into its `url` parameter.
+		val clean = path.substringBefore('?').substringBefore('#').trim()
 		val relative = when {
-			path.startsWith("http", ignoreCase = true) -> "/" + path.substringAfter("://").substringAfter('/')
-			path.startsWith("/") -> path
-			else -> "/$path"
+			clean.startsWith("http", ignoreCase = true) -> "/" + clean.substringAfter("://").substringAfter('/')
+			clean.startsWith("/") -> clean
+			else -> "/$clean"
 		}
 		val encoded = URLEncoder.encode(relative, "UTF-8")
 		return "https://$domain/_next/image?url=$encoded&w=$width&q=75"
