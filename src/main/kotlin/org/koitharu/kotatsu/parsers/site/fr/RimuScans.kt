@@ -71,11 +71,12 @@ internal class RimuScans(context: MangaLoaderContext) :
 		val latestChapterDate: Long,
 	)
 
-	// The whole catalogue (429+ titles) is embedded in the homepage Next.js payload.
-	// Fetched fresh on every list load so a pull-to-refresh surfaces newly added titles.
+	// The whole catalogue is embedded in the homepage Next.js payload as a map
+	// "series":{ "<slug>": {..}, .. }. Fetched fresh on every list load so a
+	// pull-to-refresh surfaces newly added titles.
 	private suspend fun loadCatalogue(): List<MangaCache> {
 		val doc = webClient.httpGet("https://$domain/").parseHtml()
-		return extractMangaObjects(decodePayload(doc)).map { parseMangaFromJson(it) }
+		return extractSeriesList(decodePayload(doc)).map { parseMangaFromJson(it) }
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
@@ -139,30 +140,27 @@ internal class RimuScans(context: MangaLoaderContext) :
 			?.takeIf { it.isNotBlank() && it != "null" }
 			?.let { optimizedImageUrl(it, COVER_WIDTH) }
 
-		val authors = buildSet {
-			addAll(splitNames(json.getStringOrNull("author")))
-			addAll(splitNames(json.getStringOrNull("artist")))
-		}
-
-		val altTitles = json.optJSONArray("alternativeTitles")?.let { arr ->
-			(0 until arr.length()).mapNotNull { arr.optString(it).trim().takeIf(String::isNotEmpty) }.toSet()
-		}.orEmpty()
-
 		val nsfw = json.optBoolean("isAdult", false) || json.optBoolean("isExplicit", false)
+
+		val ratingValue = json.optDouble("rating", -1.0)
+		val rating = if (ratingValue > 0) (ratingValue / 5.0).toFloat().coerceIn(0f, 1f) else RATING_UNKNOWN
 
 		val manga = Manga(
 			id = generateUid(url),
 			title = json.getStringOrNull("title") ?: slug,
-			altTitles = altTitles,
+			altTitles = emptySet(),
 			url = url,
 			publicUrl = url.toAbsoluteUrl(domain),
-			rating = RATING_UNKNOWN,
+			rating = rating,
 			contentRating = if (nsfw) ContentRating.ADULT else ContentRating.SAFE,
 			coverUrl = cover,
 			tags = parseGenres(json),
 			state = parseStatus(json.getStringOrNull("status")),
-			authors = authors,
-			description = json.getStringOrNull("description")?.takeIf { it.isNotBlank() && it != "null" },
+			authors = emptySet(),
+			// The list payload carries a short (truncated) synopsis as "desc";
+			// getDetails later replaces it with the full text.
+			description = (json.getStringOrNull("desc") ?: json.getStringOrNull("description"))
+				?.takeIf { it.isNotBlank() && it != "null" },
 			source = source,
 		)
 
@@ -174,8 +172,10 @@ internal class RimuScans(context: MangaLoaderContext) :
 		return MangaCache(
 			manga = manga,
 			type = type,
-			views = json.optInt("views", 0),
-			latestChapterDate = latestChapterDate(json.optJSONArray("chapters")),
+			// No per-title view count in the new payload; use the rating count as a
+			// popularity proxy, and the relative "lastRel" ("il y a 2 j") as recency.
+			views = json.optInt("ratingCount", 0),
+			latestChapterDate = relativeDateToTimestamp(json.getStringOrNull("lastRel")),
 		)
 	}
 
@@ -430,15 +430,51 @@ internal class RimuScans(context: MangaLoaderContext) :
 
 	// --- helpers ---
 
-	private fun latestChapterDate(chaptersArray: JSONArray?): Long {
-		if (chaptersArray == null) return 0L
-		var max = 0L
-		for (i in 0 until chaptersArray.length()) {
-			val c = chaptersArray.optJSONObject(i) ?: continue
-			val d = parseDate(c.getStringOrNull("releaseDate"))
-			if (d > max) max = d
+	/**
+	 * The full catalogue is embedded in the homepage Next.js payload as a map keyed by
+	 * slug: `"series":{ "<slug>":{ "slug":.., "title":.., "cover":.., "genres":[..],
+	 * "status":.., "type":.., "desc":.., "rating":.., "ratingCount":.., "lastRel":.. }, .. }`.
+	 * Returns every series object.
+	 */
+	private fun extractSeriesList(blob: String): List<JSONObject> {
+		val marker = "\"series\":{"
+		val at = blob.indexOf(marker)
+		if (at == -1) return emptyList()
+		val objStart = at + marker.length - 1 // position of '{'
+		val objStr = extractJsonObjectString(blob, objStart) ?: return emptyList()
+		return try {
+			val map = JSONObject(objStr)
+			val result = ArrayList<JSONObject>(map.length())
+			val keys = map.keys()
+			while (keys.hasNext()) {
+				val entry = map.optJSONObject(keys.next()) ?: continue
+				if (entry.has("slug")) result.add(entry)
+			}
+			result
+		} catch (_: Exception) {
+			emptyList()
 		}
-		return max
+	}
+
+	/**
+	 * Converts a French relative time such as "il y a 2 j" / "il y a 3 h" / "il y a 1 mois"
+	 * into an approximate absolute timestamp, used only to order the list by recency.
+	 */
+	private fun relativeDateToTimestamp(text: String?): Long {
+		if (text.isNullOrBlank()) return 0L
+		val match = Regex("""(\d+)\s*([A-Za-zÀ-ÿ]+)""").find(text) ?: return 0L
+		val n = match.groupValues[1].toLongOrNull() ?: return 0L
+		val unit = match.groupValues[2].lowercase(sourceLocale)
+		val unitMs = when {
+			unit.startsWith("min") -> 60_000L
+			unit.startsWith("h") -> 3_600_000L
+			unit.startsWith("j") -> 86_400_000L
+			unit.startsWith("sem") -> 7L * 86_400_000L
+			unit.startsWith("mo") -> 30L * 86_400_000L
+			unit.startsWith("an") -> 365L * 86_400_000L
+			else -> return 0L
+		}
+		return System.currentTimeMillis() - n * unitMs
 	}
 
 	private fun parseGenres(json: JSONObject): Set<MangaTag> {
