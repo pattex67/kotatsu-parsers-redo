@@ -15,7 +15,7 @@ import java.util.*
 internal class MangaKawaii(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.MANGAKAWAII, 50) {
 
-	override val configKeyDomain = ConfigKey.Domain("www.mangakawaii.io")
+	override val configKeyDomain = ConfigKey.Domain("www.mangakawaii.fr")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
