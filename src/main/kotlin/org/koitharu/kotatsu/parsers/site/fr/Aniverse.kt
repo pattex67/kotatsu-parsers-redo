@@ -6,7 +6,7 @@ import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
-import org.koitharu.kotatsu.parsers.core.SinglePageMangaParser
+import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
@@ -22,8 +22,11 @@ import org.koitharu.kotatsu.parsers.model.SortOrder
 import org.koitharu.kotatsu.parsers.util.generateUid
 import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.parseHtml
+import org.koitharu.kotatsu.parsers.util.parseJson
+import org.koitharu.kotatsu.parsers.util.parseJsonArray
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
+import org.koitharu.kotatsu.parsers.util.urlEncoded
 import java.text.SimpleDateFormat
 import java.util.EnumSet
 import java.util.Locale
@@ -33,17 +36,18 @@ import java.util.TimeZone
  * Parser for Aniverse (aniverse.fr), the platform that replaced raijin-scans.fr.
  *
  * Aniverse is a Next.js (App Router) app built on an AniList-style metadata model and the
- * `cdn.onefy.me` image CDN. All the data we need ships in the server-rendered RSC payload
- * (`self.__next_f.push([1,"..."])`), which we concatenate, unescape and scan as JSON:
- *  - `/manga`            homepage, embeds a "trending" array used as the browse catalogue;
- *  - `/manga/{slug}`     detail page, embeds a "manga" object + a full "chapters" array;
- *  - `/read/{slug}/{id}` reader, embeds the page images on `cdn.onefy.me`.
+ * `cdn.onefy.me` image CDN. Lists come from its JSON API, details and pages from the
+ * server-rendered RSC payload (`self.__next_f.push([1,"..."])`):
+ *  - `GET /api/manga?page={n}`              paginated catalogue, `{ "items": [...] }`;
+ *  - `GET /api/quicksearch?q={q}&media=manga`  search, a flat JSON array;
+ *  - `/manga/{slug}`                        detail page, embeds a "manga" object + "chapters";
+ *  - `/read/{slug}/{chapterId}`             reader, embeds the page images on `cdn.onefy.me`.
  *
  * The enum id is kept as RAIJINSCANS so existing users keep their saved source selection.
  */
 @MangaSourceParser("RAIJINSCANS", "Aniverse", "fr")
 internal class Aniverse(context: MangaLoaderContext) :
-	SinglePageMangaParser(context, MangaParserSource.RAIJINSCANS) {
+	PagedMangaParser(context, MangaParserSource.RAIJINSCANS, pageSize = 28) {
 
 	override val configKeyDomain = ConfigKey.Domain("aniverse.fr")
 
@@ -74,38 +78,43 @@ internal class Aniverse(context: MangaLoaderContext) :
 		"""https://cdn\.onefy\.me/t/(?:w_\d+/)?manga/[0-9a-fA-F-]+/c\d+-[0-9a-zA-Z]+/(\d+)\.(?:jpg|jpeg|png|webp|gif)""",
 	)
 
-	override suspend fun getList(order: SortOrder, filter: MangaListFilter): List<Manga> {
-		val doc = webClient.httpGet("https://$domain/manga").parseHtml()
-		val trending = extractArray(decodePayload(doc), "\"trending\":[") ?: return emptyList()
-
-		var list = (0 until trending.length())
-			.mapNotNull { trending.optJSONObject(it) }
-			.mapNotNull { parseTrendingManga(it) }
-
-		if (!filter.query.isNullOrEmpty()) {
-			val query = filter.query.lowercase(sourceLocale)
-			list = list.filter { it.title.lowercase(sourceLocale).contains(query) }
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		val items: JSONArray = if (!filter.query.isNullOrEmpty()) {
+			// quicksearch returns a flat, un-paginated array of matches.
+			if (page > searchPaginator.firstPage) return emptyList()
+			val url = "https://$domain/api/quicksearch?q=${filter.query.urlEncoded()}&media=manga"
+			webClient.httpGet(url).parseJsonArray()
+		} else {
+			val url = "https://$domain/api/manga?page=$page"
+			webClient.httpGet(url).parseJson().optJSONArray("items") ?: return emptyList()
 		}
-		return list
+		return (0 until items.length())
+			.mapNotNull { items.optJSONObject(it) }
+			.mapNotNull { parseListManga(it) }
 	}
 
-	private fun parseTrendingManga(json: JSONObject): Manga? {
+	/** Builds a [Manga] from a catalogue (`/api/manga`) or search (`/api/quicksearch`) entry. */
+	private fun parseListManga(json: JSONObject): Manga? {
 		val slug = json.getStringOrNull("slug")?.takeIf { it.isNotBlank() } ?: return null
 		val url = "/manga/$slug"
 		val title = json.getStringOrNull("title")
 			?: json.getStringOrNull("titleEnglish")
 			?: json.getStringOrNull("titleRomaji")
 			?: slug
+		// Search entries carry a 0..10 rating; catalogue entries have none.
+		val ratingValue = json.optDouble("rating", -1.0)
+		val rating = if (ratingValue > 0) (ratingValue / 10.0).toFloat().coerceIn(0f, 1f) else RATING_UNKNOWN
 		return Manga(
 			id = generateUid(url),
 			title = title,
 			altTitles = setOfNotNull(
 				json.getStringOrNull("titleEnglish")?.takeIf { !it.equals(title, ignoreCase = true) },
 				json.getStringOrNull("titleRomaji")?.takeIf { !it.equals(title, ignoreCase = true) },
+				json.getStringOrNull("titleNative")?.takeIf { !it.equals(title, ignoreCase = true) },
 			),
 			url = url,
 			publicUrl = url.toAbsoluteUrl(domain),
-			rating = RATING_UNKNOWN,
+			rating = rating,
 			contentRating = ContentRating.SAFE,
 			coverUrl = json.getStringOrNull("image"),
 			tags = emptySet(),
@@ -293,17 +302,6 @@ internal class Aniverse(context: MangaLoaderContext) :
 		val objStr = extractJsonObjectString(blob, at + marker.length - 1) ?: return null
 		return try {
 			JSONObject(objStr)
-		} catch (_: Exception) {
-			null
-		}
-	}
-
-	private fun extractArray(blob: String, marker: String): JSONArray? {
-		val at = blob.indexOf(marker)
-		if (at == -1) return null
-		val arrStr = extractJsonArrayString(blob, at + marker.length - 1) ?: return null
-		return try {
-			JSONArray(arrStr)
 		} catch (_: Exception) {
 			null
 		}
