@@ -24,6 +24,7 @@ import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.parseHtml
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseJsonArray
+import org.koitharu.kotatsu.parsers.util.parseRaw
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
 import org.koitharu.kotatsu.parsers.util.urlEncoded
@@ -71,11 +72,12 @@ internal class Aniverse(context: MangaLoaderContext) :
 	private val nextFPushRegex =
 		Regex("""self\.__next_f\.push\(\s*\[\s*1\s*,\s*"(.*)"\s*]\s*\)""", RegexOption.DOT_MATCHES_ALL)
 
-	// Matches a full-size reader page image, e.g.
-	// https://cdn.onefy.me/t/manga/<uuid>/c0-<hash>/001.jpg
-	// and its resize variants  https://cdn.onefy.me/t/w_720/manga/<uuid>/c0-<hash>/001.jpg
+	// Matches a reader page image, capturing (1) the chapter folder and (2) the page number:
+	// https://cdn.onefy.me/t/manga/<uuid>/c101-<hash>/001.jpg
+	// and its resize variants  https://cdn.onefy.me/t/w_720/manga/<uuid>/c101-<hash>/001.jpg
+	// Posters (/poster-*) and chapter thumbnails (/chapter-covers/*) don't match the /c<n>-<hash>/ form.
 	private val pageImageRegex = Regex(
-		"""https://cdn\.onefy\.me/t/(?:w_\d+/)?manga/[0-9a-fA-F-]+/c\d+-[0-9a-zA-Z]+/(\d+)\.(?:jpg|jpeg|png|webp|gif)""",
+		"""https://cdn\.onefy\.me/t/(?:w_\d+/)?manga/[0-9a-fA-F-]+/(c\d+-[0-9a-zA-Z]+)/(\d+)\.(?:jpg|jpeg|png|webp|gif|avif)""",
 	)
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
@@ -206,21 +208,23 @@ internal class Aniverse(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-		val blob = decodePayload(doc)
-
-		// The reader embeds every page as an image on cdn.onefy.me, both as a full-size URL
-		// and as `w_<width>` resize variants in a srcset. Normalise each to the full-size form
-		// (dropping the `/w_<width>` segment), dedupe, then order by the trailing page number.
-		val pages = LinkedHashMap<String, Int>()
-		for (match in pageImageRegex.findAll(blob)) {
+		// The reader page server-renders every page image on cdn.onefy.me directly in the HTML
+		// (as <img>/preload tags), not inside the __next_f RSC payload — so scan the raw HTML.
+		// Each page appears as a full-size URL plus `w_<width>` resize variants; normalise those
+		// back to the full-size form. The page may also reference a neighbouring chapter's cover,
+		// so group by chapter folder (c<n>-<hash>) and keep the folder holding the most pages.
+		val html = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseRaw()
+		val folders = HashMap<String, LinkedHashMap<Int, String>>()
+		for (match in pageImageRegex.findAll(html)) {
+			val folder = match.groupValues[1]
+			val pageNo = match.groupValues[2].toIntOrNull() ?: continue
 			val fullSize = match.value.replace(Regex("""/t/w_\d+/manga/"""), "/t/manga/")
-			val pageNo = match.groupValues[1].toIntOrNull() ?: 0
-			pages.putIfAbsent(fullSize, pageNo)
+			folders.getOrPut(folder) { LinkedHashMap() }.putIfAbsent(pageNo, fullSize)
 		}
+		val pages = folders.values.maxByOrNull { it.size } ?: return emptyList()
 		return pages.entries
-			.sortedBy { it.value }
-			.map { (url, _) ->
+			.sortedBy { it.key }
+			.map { (_, url) ->
 				MangaPage(
 					id = generateUid(url),
 					url = url,
