@@ -65,6 +65,13 @@ internal class Aniverse(context: MangaLoaderContext) :
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions()
 
+	private companion object {
+		// Width requested from the onefy resize endpoint (/t/w_<width>/...) for reader pages.
+		// The service clamps to the image's native width, so a high value maximises quality
+		// without upscaling small pages.
+		private const val PAGE_WIDTH = 1600
+	}
+
 	private val isoDateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ENGLISH).apply {
 		timeZone = TimeZone.getTimeZone("UTC")
 	}
@@ -218,8 +225,13 @@ internal class Aniverse(context: MangaLoaderContext) :
 		for (match in pageImageRegex.findAll(html)) {
 			val folder = match.groupValues[1]
 			val pageNo = match.groupValues[2].toIntOrNull() ?: continue
-			val fullSize = match.value.replace(Regex("""/t/w_\d+/manga/"""), "/t/manga/")
-			folders.getOrPut(folder) { LinkedHashMap() }.putIfAbsent(pageNo, fullSize)
+			// The bare /t/manga/.../NNN.jpg "original" isn't stored on the CDN (it 404s with
+			// "File not found"); only the /t/w_<width>/ resize variants exist. Normalise every
+			// match to a single large width so each page resolves to a real image.
+			val sized = match.value
+				.replace(Regex("""/t/w_\d+/manga/"""), "/t/manga/")
+				.replace("/t/manga/", "/t/w_$PAGE_WIDTH/manga/")
+			folders.getOrPut(folder) { LinkedHashMap() }.putIfAbsent(pageNo, sized)
 		}
 		val pages = folders.values.maxByOrNull { it.size } ?: return emptyList()
 		return pages.entries
@@ -276,9 +288,13 @@ internal class Aniverse(context: MangaLoaderContext) :
 		return isoDateFormat.parseSafe(dateString.trim())
 	}
 
-	/** Finds the longest `"chapters":[...]` array anywhere in the decoded payload. */
+	/**
+	 * Finds the longest `"latestChapters":[...]` array in the decoded payload. On the detail page
+	 * this key carries the full chapter list (id/number/updatedAt/premiumUntil), not just the
+	 * latest ones; the homepage/related-manga copies are shorter, so the largest one wins.
+	 */
 	private fun findLargestChaptersArray(blob: String): JSONArray? {
-		val marker = "\"chapters\":["
+		val marker = "\"latestChapters\":["
 		var best: JSONArray? = null
 		var searchIdx = 0
 		while (true) {
