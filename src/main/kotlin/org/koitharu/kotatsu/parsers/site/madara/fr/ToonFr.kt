@@ -18,6 +18,12 @@ internal class ToonFr(context: MangaLoaderContext) :
 	override val listUrl = "webtoon/"
 	override val datePattern = "MMM d"
 
+	// The site sits behind Cloudflare. Loading the catalogue through admin-ajax.php makes the
+	// challenge WebView render WordPress' bare "0" response (and the POST itself returns "0"),
+	// so the list stays empty until a plain page request sets the clearance cookie. Fetching the
+	// list as a normal page GET (/page/N/?s=&post_type=wp-manga) avoids both problems.
+	override val withoutAjax = true
+
 	override suspend fun loadChapters(mangaUrl: String, document: Document): List<MangaChapter> {
 		val url = mangaUrl.toAbsoluteUrl(domain).removeSuffix('/') + "/ajax/chapters/"
 		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
